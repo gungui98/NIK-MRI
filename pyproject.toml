@@ -1,0 +1,23 @@
+[project]
+name = "nik-mri"
+version = "0.1.0"
+description = "Neural Implicit K-space reconstruction for cardiac MRI"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "torch>=2.0.0",
+    "torchvision>=0.15.0",
+    "numpy>=1.24.0",
+    "matplotlib>=3.7.0",
+    "pyyaml>=6.0",
+    "h5py>=3.8.0",
+    "wandb>=0.15.0",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["datasets*", "models*", "utils*"]
