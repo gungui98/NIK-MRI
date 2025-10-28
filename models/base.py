@@ -5,6 +5,7 @@ import numpy as np
 from abc import abstractmethod, ABC
 from utils.mri import ifft2c_mri, coilcombine
 from utils.loss import HDRLoss_FF, AdaptiveHDRLoss
+from datetime import datetime
 
 
 """
@@ -83,7 +84,6 @@ class NIKBase(nn.Module, ABC):
                 project=self.config['wandb_project'], 
                 name=self.exp_id,
                 config=self.config,
-                group=f'{self.config["num_cardiac_cycles"]} heartbeats',
             )
 
     def exp_summary_log(self, log_dict):
@@ -108,7 +108,7 @@ class NIKBase(nn.Module, ABC):
 
         # TODO: add lr scheduler to training
 
-        exp_id = "_".join([self.config['slice_name'], f"{self.config['num_cardiac_cycles']}_{self.config['hdr_ff_factor']}"])
+        exp_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.exp_id = exp_id
         self.model_save_path = os.path.join('model_checkpoints', exp_id)
         if not os.path.exists(self.model_save_path):

@@ -33,43 +33,4 @@ img_coil_combined = compute_coil_combined_reconstructions(
     kspace, sens_maps, y_shift, remove_oversampling=True
 )
 
-plt.imshow(abs(img_coil_combined[15, 0].T), cmap="gray")
-plt.title(f"{subject} - Coil Combined Reconstruction")
-plt.axis("off")
-plt.show()
-
-
-# 1b) Load the coil-combined reconstruction (equivalent to the above):
-img_coil_combined, nifti_header = load_coil_combined_reconstruction(
-    f"{data_path}/{subject}/t2s_gre_fr_recon.hf"
-)
-# the nifti_header can be used to save the data as nifti for further processing
-
-
-# 1c) Load the reference exclusion mask for the motion-corrupted acquisition (if available):
-ref_mask = load_reference_mask(
-    f"{data_path}/{subject}/motion_mask_t2s_gre_fr_move.txt"
-)
-# shape [36, 92] for 36 slices and 92 PE lines;
-# 0: subject was instructed to move during acquisition of this PE line
-# 1: subject was instructed to stay still during acquisition of this PE line
-
-
-# 1d) Load the segmentations:
-brain_mask = load_segmentation(
-    f"{data_path}/{subject}/seg_brain_reg-to-t2s.nii"
-)
-white_matter = load_segmentation(
-    f"{data_path}/{subject}/seg_wm_reg-to-t2s.nii"
-)
-gray_matter = load_segmentation(
-    f"{data_path}/{subject}/seg_gm_reg-to-t2s.nii"
-)
-
-
-"""2) Loading the motion data:"""
-motion_data = load_motion_data(
-    f"{data_path}/{subject}/motion_data.json"
-)
-# dicitionary with keys: 't_x', 't_y', 't_z', 'r_x', 'r_y', 'r_z', 'time'
-# (translational and rotational parameters in mm and °) and time points in seconds
+print(img_coil_combined.shape)

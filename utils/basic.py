@@ -1,6 +1,8 @@
 import re
 import yaml
 import os
+import torch
+import numpy as np
 
 def parse_config(path=None, data=None, tag='!ENV'):
     """
@@ -56,3 +58,19 @@ def parse_config(path=None, data=None, tag='!ENV'):
         return yaml.load(data, Loader=loader)
     else:
         raise ValueError('Either a path or data should be defined as input')
+
+def ensure_tensor(data):
+    if isinstance(data, torch.Tensor):
+        return data
+    elif isinstance(data, np.ndarray):
+        return torch.from_numpy(data)
+    else:
+        raise ValueError(f"Unsupported data type: {type(data)}")
+
+def ensure_numpy(data):
+    if isinstance(data, torch.Tensor):
+        return data.detach().cpu().numpy()
+    elif isinstance(data, np.ndarray):
+        return data
+    else:
+        raise ValueError(f"Unsupported data type: {type(data)}")
