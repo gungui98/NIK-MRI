@@ -144,7 +144,7 @@ def compute_coil_combined_reconstructions(kspace, sens_maps,
             sens_maps_t = sens_maps[None, None]
         else:
             sens_maps_t = sens_maps
-
+    sens_maps_t = sens_maps_t.to(coil_imgs.device)
     img_cc = torch.sum(coil_imgs * torch.conj(sens_maps_t), dim=2)
     if remove_oversampling:
         tmp = int(img_cc.shape[-1] / 4)
@@ -206,9 +206,9 @@ def load_motion_data(file_path):
 def k2img(k, csm=None, im_size=None, norm_factor=1):
     """
     Convert k-space to image space
-    :param k: k-space data on a Cartesian grid
-    :param csm: coil sensitivity maps
-    :return: image
+    :param k: k-space data on a Cartesian grid, shape: (echo, slices, kx, ky)
+    :param csm: coil sensitivity maps, shape: (slice, kx, ky)
+    :return: image with shape (slices, kx, ky)
     """
 
     coil_img = ifft2c_mri(k)
@@ -217,16 +217,18 @@ def k2img(k, csm=None, im_size=None, norm_factor=1):
         if csm is not None:
             csm = center_crop(csm, im_size)
 
-    k_mag = k[:,4,:,:].abs().unsqueeze(1).detach().cpu().numpy()        # nt, nx, ny   
+    # k has shape (echo, slices, kx, ky), select middle echo for k_mag visualization
+    k_mag = k[k.shape[0]//2,:,:,:].abs().unsqueeze(1).detach().cpu().numpy()        # slices, 1, kx, ky   
     # combined_img_motion = coil_img_motion.abs()
     if csm is not None:
         if len(csm.shape) == len(coil_img.shape):
-            im_shape = csm.shape[2:]        # (nx, ny)
+            im_shape = csm.shape[1:]        # (kx, ky)
         else:
-            im_shape = csm.shape[1:]        # (nx, ny)
-        combined_img = coilcombine(coil_img, im_shape, coil_dim=1, csm=csm)
+            im_shape = csm.shape[1:]        # (kx, ky)
+        # Combine along echo dimension (dim=0), output will be (slices, kx, ky)
+        combined_img = coilcombine(coil_img, im_shape, coil_dim=0, csm=csm)
     else:
-        combined_img = coilcombine(coil_img, coil_dim=1, mode='rss')
+        combined_img = coilcombine(coil_img, coil_dim=0, mode='rss')
     combined_phase = torch.angle(combined_img).detach().cpu().numpy()
     combined_mag = combined_img.abs().detach().cpu().numpy()
     k_mag = np.log(np.abs(k_mag) + 1e-4)

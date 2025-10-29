@@ -169,13 +169,15 @@ class BrainDataset(Dataset):
             dict: sample containing coordinates and target k-space value
         """
         # Point-wise sampling for neural implicit k-space training
+        # TODO: set index = 0 for now to see if the dataset is working
+        index = 0
         sample = {
             'coords': self.kspace_coordinates_flat[index],  # 4D coordinates [echo, coil, kx, ky]
             'targets': self.kspace_data_flat[index]         # Target k-space value (complex)
         }
         return sample
     
-    def reconstruct_images(self):
+    def reconstruct_images(self, k_space):
         """Reconstruct coil-combined images from k-space data.
         
         Uses the stored k-space data, coil sensitivity maps, and y-shift to
@@ -187,7 +189,7 @@ class BrainDataset(Dataset):
         from utils.vis import compute_coil_combined_reconstructions
         
         # Use stored k-space and CSM (already unnormalized original data)
-        kspace = self.kspace_data_original  # (echoes, coils, kx, ky)
+        kspace = k_space  # (echoes, coils, kx, ky)
         sens_maps = self.csm  # (coils, kx, ky)
         y_shift = self.y_shift
         

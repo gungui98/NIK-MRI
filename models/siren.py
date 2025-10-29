@@ -50,7 +50,7 @@ class NIKSiren(NIKBase):
         self.optimizer.step()
         return loss
     
-    def test_batch(self):
+    def test_batch(self, kspace_data_original=None):
         """
         Test the network with a cartesian grid.
         if sample is not None, it will return image combined with coil sensitivity.
@@ -61,7 +61,19 @@ class NIKSiren(NIKBase):
             ny = self.config['ny']
 
             ts = torch.linspace(-1+1/nt, 1-1/nt, nt)
-            nc = len(self.config['coil_select'])
+            # Infer coil dimension
+            if kspace_data_original is not None:
+                # Support numpy arrays and torch tensors
+                try:
+                    nc = int(kspace_data_original.shape[1])
+                except Exception as e:
+                    raise ValueError("kspace_data_original must have a shape with coil at dim=1") from e
+            elif self.config.get('coil_select'):
+                nc = len(self.config['coil_select'])
+            elif 'nc' in self.config:
+                nc = int(self.config['nc'])
+            else:
+                raise ValueError("Cannot infer number of coils (nc). Provide kspace_data_original or set coil_select/nc in config.")
             kc = torch.linspace(-1, 1, nc)
             kxs = torch.linspace(-1, 1-2/nx, nx)
             kys = torch.linspace(-1, 1-2/ny, ny)
