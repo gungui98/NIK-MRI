@@ -37,18 +37,24 @@ class BrainDataset(Dataset):
             data_file = f"{subject_dir}/{file_name}"
         
         # Load brain data with multi-echo acquisition
-        self.brain_data = self.get_subject_data(data_file, config['slice'])
         
-        # kspace_data dimensions: [num_echoes, num_coils, kx, ky]
+                
+        self.selected_slices = config['selected_slices']
+        self.selected_coils = config['selected_coils']
+        self.selected_echoes = config['selected_echoes']
         
+        kspace_raw, sens_maps_raw, y_shift = load_brain_h5(data_file)
+        
+        kspace = kspace_raw[self.selected_slices, self.selected_echoes, self.selected_coils, :, :]
+        sens_maps = sens_maps_raw[self.selected_slices, :, self.selected_coils, :, :]
         # Flatten k-space data for point-wise training: [total_kpoints, 1]
-        self.kspace_data_flat = np.reshape(self.brain_data['kdata'].astype(np.complex64), (-1, 1))
+        self.kspace_data_flat = np.reshape(kspace.astype(np.complex64), (-1, 1))
 
         # Keep original k-space data shape for reference
-        self.kspace_data_original = self.brain_data['kdata'].astype(np.complex64)
+        self.kspace_data_original = kspace.astype(np.complex64)
         
         # Extract k-space dimensions
-        num_echoes, num_coils, kx_dim, ky_dim = self.brain_data['kdata'].shape
+        num_echoes, num_coils, kx_dim, ky_dim = kspace.shape
         self.total_kpoints = self.kspace_data_flat.shape[0]
         
         # Create 4D coordinate system for Cartesian k-space
@@ -84,76 +90,6 @@ class BrainDataset(Dataset):
         self.kspace_coordinates_flat = torch.from_numpy(self.kspace_coordinates_flat)  # shape: [total_kpoints, 4]
         
     
-    def get_subject_data(self, data_file, slice_idx):
-        """Load and process subject-specific brain MRI data from HDF5 file.
-        
-        Args:
-            data_file: path to HDF5 file containing brain data
-            slice_idx: which slice to select from the volume
-            
-        Returns:
-            dict: processed brain data including k-space and coil sensitivity maps
-        """
-        # Load raw data using flexible loader
-        kspace_raw, sens_maps_raw, y_shift = load_brain_h5(data_file)
-        
-        # kspace_raw shape: (num_slices, num_echoes, num_coils, kx, ky)
-        # sens_maps_raw shape: (num_slices, 1, num_coils, kx, ky_half) - half due to readout oversampling
-        
-        # Support files with or without slice dimension
-        if kspace_raw.ndim == 5:
-            num_slices, num_echoes, num_coils, kx_dim, ky_dim = kspace_raw.shape
-        elif kspace_raw.ndim == 4:
-            num_slices = 1
-            num_echoes, num_coils, kx_dim, ky_dim = kspace_raw.shape
-            kspace_raw = kspace_raw[None]
-            # sens_maps may be [slices, 1, coils, kx, ky_half] or [1, coils, kx, ky_half]
-            if sens_maps_raw.ndim == 4:
-                sens_maps_raw = sens_maps_raw[None]
-        else:
-            raise ValueError(f"Unexpected kspace shape: {kspace_raw.shape}")
-        
-        # Select coils if requested
-        coil_select = self.config.get('coil_select', [])
-
-        # Select single slice
-        kspace_slice = kspace_raw[slice_idx]  # (E, C, Kx, Ky)
-        if coil_select:
-            kspace_slice = kspace_slice[:, coil_select]
-        # sens_maps_raw expected shape: (S, 1, C, Kx, Ky_half) or (S, C, Kx, Ky_half)
-        if sens_maps_raw.ndim == 5:
-            sens_maps_slice = sens_maps_raw[slice_idx, 0]
-        elif sens_maps_raw.ndim == 4:
-            sens_maps_slice = sens_maps_raw[slice_idx]
-        else:
-            raise ValueError(f"Unexpected sens_maps shape: {sens_maps_raw.shape}")
-
-        if coil_select:
-            sens_maps_slice = sens_maps_slice[coil_select]
-        
-        # Pad sensitivity maps to match k-space dimensions
-        sens_maps_padded = pad_sensitivity_maps(
-            sens_maps_slice[np.newaxis, np.newaxis, :, :, :],
-            kspace_slice[0:1].shape
-        )[0, 0]
-        
-        # Normalize coil sensitivity maps to avoid division by zero
-        # Compute root-sum-of-squares (RSS) across coils for normalization
-        coil_sensitivity_maps_rss = rss(sens_maps_padded, coil_axis=0)
-        coil_sensitivity_maps = np.nan_to_num(sens_maps_padded / coil_sensitivity_maps_rss)
-        self.csm = coil_sensitivity_maps  # Store for later use in reconstruction
-        self.y_shift = y_shift  # Store y-shift for reconstruction
-        
-        # Prepare processed brain data dictionary
-        processed_brain_data = {
-            'subject': data_file.split('/')[-2],
-            'slice': slice_idx,
-            'kdata': kspace_slice,
-            'csm': coil_sensitivity_maps,
-            'y_shift': y_shift,
-        }
-        
-        return processed_brain_data
     
     def __len__(self):
         """Return total number of k-space points for training."""

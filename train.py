@@ -59,11 +59,11 @@ def main():
 
     for epoch in range(config['num_steps']):
         loss_epoch = 0
-        for i, sample in enumerate(dataloader):
-            # kcoord, kv = sample['coords'], sample['target']
-            loss = NIKmodel.train_batch(sample)
-            print(f"Epoch: {epoch}, Iter: {i}, Loss: {loss}")
-            loss_epoch += loss
+        # for i, sample in enumerate(dataloader):
+        #     # kcoord, kv = sample['coords'], sample['target']
+        #     loss = NIKmodel.train_batch(sample)
+        #     print(f"Epoch: {epoch}, Iter: {i}, Loss: {loss}")
+        #     loss_epoch += loss
 
         # if requested, visualize the "perfect fit" by using ground-truth k-space targets
         ktarget = torch.from_numpy(dataset.kspace_data_original).to(torch.complex64) # 12, 31, 92, 224
