@@ -1,3 +1,5 @@
 {
-    "python.languageServer": "None"
+    "python.languageServer": "None",
+    "terminal.integrated.defaultLocation": "view",
+    "terminal.integrated.persistentSessionReviveProcess": "onExit"
 }

@@ -1,36 +1,39 @@
-import matplotlib.pyplot as plt
-from utils.vis import compute_coil_combined_reconstructions, load_coil_combined_reconstruction,\
-    load_reference_mask, load_segmentation, load_motion_data, angle2color, k2img, get_yshift,\
-    compute_coil_combined_reconstructions
-import h5py
+import argparse
+import random
 
-def load_raw_data(file_path):
-    """Load raw data from the T2*-MOVE dataset."""
+import torch
+import numpy as np
 
-    with h5py.File(file_path, "r") as hf_file:
-        raw_data = hf_file['kspace'][()]
-        sens_maps = hf_file['sens_maps'][()]
-        y_shift = get_yshift(hf_file)
+from utils.basic import parse_config
+from datasets.brain import BrainDataset
 
-    return raw_data, sens_maps, y_shift
+from utils.vis import (visualize_reconstruction, visualize_all_echoes, find_best_slice)
 
+def main():
+    # parse args and get config
+    config = parse_config('configs/config_brain.yml')
 
-# define the path to the T2*-MOVE dataset:
-data_path = "/Users/phinguyen/Documents/qMRI/data/helmholtz/val_recon"
+    # create dataset
+    dataset = BrainDataset(config)
 
+    # if requested, visualize the "perfect fit" by using ground-truth k-space targets
+    ktarget = torch.from_numpy(dataset.kspace).to(torch.complex64) # 12, 31, 92, 224
+    kpred = ktarget
 
-"""Demo code for loading the T2*-MOVE dataset"""
-"""1) Loading the MRI data:"""
-# define the subset and subject to load:
-subject = "sub-07"
+        # New: Reconstruct images using legacy approach and visualize
+    img_recon = dataset.reconstruct_images(k_space=kpred)  # (slices, echoes, kx, ky)
+    print(f"Reconstructed image shape: {img_recon.shape}")
 
-# 1a) Load the (motion-free, full-resolution) raw data and perform coil-combined reconstruction:
-kspace, sens_maps, y_shift = load_raw_data(
-    f"{data_path}/{subject}/t2s_gre_fr.hf"
-)
+    # Choose a representative slice to visualize
+    best_slice = find_best_slice(img_recon)
 
-img_coil_combined = compute_coil_combined_reconstructions(
-    kspace, sens_maps, y_shift, remove_oversampling=True
-)
+    # Save single echo visualization
+    visualize_reconstruction(img_recon, slice_idx=best_slice, echo_idx=0,
+                             output_prefix=f"{'selected' if config['is_selected'] else 'all'}_best")
 
-print(img_coil_combined.shape)
+    # Save all echoes visualization for that slice
+    visualize_all_echoes(img_recon, slice_idx=best_slice,
+                         output_prefix=f"{'selected' if config['is_selected'] else 'all'}_best")
+
+if __name__ == '__main__':
+    main()

@@ -8,9 +8,10 @@ subject: sub-07  # Options: sub-07, sub-08, sub-09
 # If omitted, the first .h5/.hf under subject folder will be used
 file_name: t2s_gre_fr.hf
 # Optional coil selection (0-based indices). If omitted, use all coils
+is_selected: False # dont filter by selected slices, echoes, and coils if True
 selected_coils: [0,1,2,3]
 selected_echoes: [0,1,2,3]
-selected_slices: [1,2,3,4]  # Select slice from 0-35 (36 slices total)
+selected_slices: [14,15,16,17]  # Select slice from 0-35 (36 slices total)
 batch_size: 30000
 num_workers: 8
 sample_per_epoch: 100

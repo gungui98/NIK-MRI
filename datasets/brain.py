@@ -1,9 +1,12 @@
+from typing import Any
+
+
 import os
 from torch.utils.data import Dataset
 import torch
 import numpy as np
 import h5py
-from utils.vis import load_brain_h5, pad_sensitivity_maps
+from utils.vis import load_brain_h5, pad_sensitivity_maps, compute_coil_combined_reconstructions
 from utils.medutils_compat import rss
 
 
@@ -37,16 +40,25 @@ class BrainDataset(Dataset):
             data_file = f"{subject_dir}/{file_name}"
         
         # Load brain data with multi-echo acquisition
+        csm, y_shift, kspace = self.load_raw_data(data_file)
         
-                
-        self.selected_slices = config['selected_slices']
-        self.selected_coils = config['selected_coils']
-        self.selected_echoes = config['selected_echoes']
+        if config['is_selected']:
+            self.selected_slices = config['selected_slices']
+            self.selected_echoes = config['selected_echoes']
+            self.selected_coils = config['selected_coils']
+            
+            # k_space_idx = np.ix_(self.selected_slices, self.selected_echoes, self.selected_coils)
+            # csm_idx = np.ix_(self.selected_slices, [0], self.selected_coils) # we only need one sensitivity map for reconstruction
+            # select all slices, echoes, and coils
+            k_space_idx = np.ix_(self.selected_slices, self.selected_echoes, self.selected_coils)
+            csm_idx = np.ix_(self.selected_slices, [0], self.selected_coils) # we only need one sensitivity map for reconstruction
+            kspace = kspace[k_space_idx]
+            csm = csm[csm_idx]
         
-        kspace_raw, sens_maps_raw, y_shift = load_brain_h5(data_file)
-        
-        kspace = kspace_raw[self.selected_slices, self.selected_echoes, self.selected_coils, :, :]
-        sens_maps = sens_maps_raw[self.selected_slices, :, self.selected_coils, :, :]
+        self.csm = csm
+        self.y_shift = y_shift
+        self.kspace = kspace
+
         # Flatten k-space data for point-wise training: [total_kpoints, 1]
         self.kspace_data_flat = np.reshape(kspace.astype(np.complex64), (-1, 1))
 
@@ -54,31 +66,27 @@ class BrainDataset(Dataset):
         self.kspace_data_original = kspace.astype(np.complex64)
         
         # Extract k-space dimensions
-        num_echoes, num_coils, kx_dim, ky_dim = kspace.shape
+        num_slices, num_echoes, num_coils, kx_dim, ky_dim = kspace.shape
         self.total_kpoints = self.kspace_data_flat.shape[0]
         
-        # Create 4D coordinate system for Cartesian k-space
-        # Initialize 4D coordinate array: [echo, coil, kx, ky]
-        kspace_coordinates = np.zeros((num_echoes, num_coils, kx_dim, ky_dim, 4))
-        
-        # Echo coordinate: normalize from [0, num_echoes-1] to [-1, 1]
-        echo_coordinates = np.linspace(-1, 1, num_echoes)
-        kspace_coordinates[:,:,:,:,0] = echo_coordinates.reshape(num_echoes, 1, 1, 1)
-        
-        # Coil coordinate: linear spacing from -1 to 1 for each coil
-        coil_coordinates = np.linspace(-1, 1, num_coils)
-        kspace_coordinates[:,:,:,:,1] = coil_coordinates.reshape(1, num_coils, 1, 1)
-        
-        # kx coordinate: Cartesian grid normalized to [-1, 1]
-        kx_coordinates = np.linspace(-1, 1, kx_dim)
-        kspace_coordinates[:,:,:,:,2] = kx_coordinates.reshape(1, 1, kx_dim, 1)
-        
-        # ky coordinate: Cartesian grid normalized to [-1, 1]
-        ky_coordinates = np.linspace(-1, 1, ky_dim)
-        kspace_coordinates[:,:,:,:,3] = ky_coordinates.reshape(1, 1, 1, ky_dim)
+        # Create 4D coordinate system [echo, coil, kx, ky] broadcast over slices
+        # Normalized to [-1, 1] per dimension
+        echo_lin = np.linspace(-1, 1, num_echoes, dtype=np.float32).reshape(1, num_echoes, 1, 1, 1)
+        coil_lin = np.linspace(-1, 1, num_coils, dtype=np.float32).reshape(1, 1, num_coils, 1, 1)
+        kx_lin = np.linspace(-1, 1, kx_dim, dtype=np.float32).reshape(1, 1, 1, kx_dim, 1)
+        ky_lin = np.linspace(-1, 1, ky_dim, dtype=np.float32).reshape(1, 1, 1, 1, ky_dim)
+
+        target_shape = (num_slices, num_echoes, num_coils, kx_dim, ky_dim)
+        echo_grid = np.broadcast_to(echo_lin, target_shape)
+        coil_grid = np.broadcast_to(coil_lin, target_shape)
+        kx_grid = np.broadcast_to(kx_lin, target_shape)
+        ky_grid = np.broadcast_to(ky_lin, target_shape)
+
+        # Stack into last dim → (..., 4)
+        coords = np.stack([echo_grid, coil_grid, kx_grid, ky_grid], axis=-1)
 
         # Flatten coordinates for point-wise training: [total_kpoints, 4]
-        self.kspace_coordinates_flat = np.reshape(kspace_coordinates.astype(np.float32), (-1, 4))
+        self.kspace_coordinates_flat = coords.reshape(-1, 4).astype(np.float32)
 
         # Normalize k-space data magnitude for stable training
         # Use same normalization strategy as cardiac dataset
@@ -89,7 +97,95 @@ class BrainDataset(Dataset):
         self.kspace_data_flat = torch.from_numpy(self.kspace_data_flat)      # shape: [total_kpoints, 1]
         self.kspace_coordinates_flat = torch.from_numpy(self.kspace_coordinates_flat)  # shape: [total_kpoints, 4]
         
+    def load_raw_data(self, filename):
+        """Load raw data from h5 file."""
+        with h5py.File(filename, "r") as f:
+            kspace, sens_maps = self.process_raw_data(f)
+            y_shift = self.get_yshift(f)
+            sens_maps = pad_sensitivity_maps(sens_maps, kspace.shape)
     
+        return sens_maps, y_shift, kspace
+    
+    def process_raw_data(self, hf_file):
+        """Load raw data from h5 file and process to proper complex data.
+        
+        Handles both legacy format (out/Data) and new format (kspace/kdata).
+        """
+        # Try legacy format first
+        if 'out' in hf_file:
+            raw_data = hf_file['out']['Data'][:, :, 0, 0, :, 0]
+            sens_maps = hf_file['out']['SENSE']['maps'][:, :, 0, 0, :, 0]
+
+            if (isinstance(raw_data, np.ndarray) and
+                    raw_data.dtype == [('real', '<f4'), ('imag', '<f4')]):
+                return (raw_data.view(np.complex64).astype(np.complex64),
+                        sens_maps.view(np.complex64).astype(np.complex64))
+            else:
+                print('Error: Unexpected data format:', raw_data.dtype)
+                return None, None
+        
+        # Try new format with flexible keys
+        else:
+            # Try to find k-space data
+            kspace_keys = ['kspace', 'kdata', 'k', 'raw/kspace', 'raw/kdata']
+            sens_keys = ['sens_maps', 'smap', 'csm', 'sensitivity_maps', 'sensmaps']
+            
+            kspace = None
+            sens_maps = None
+            
+            for key in kspace_keys:
+                if key in hf_file:
+                    kspace = hf_file[key][()]
+                    break
+            
+            for key in sens_keys:
+                if key in hf_file:
+                    sens_maps = hf_file[key][()]
+                    break
+            
+            if kspace is None:
+                print(f"Error: Could not find k-space data. Available keys: {list(hf_file.keys())}")
+                return None, None
+            
+            if sens_maps is None:
+                print(f"Error: Could not find sensitivity maps. Available keys: {list(hf_file.keys())}")
+                return None, None
+            
+            # Ensure complex type
+            if not np.iscomplexobj(kspace):
+                kspace = kspace.astype(np.complex64)
+            if not np.iscomplexobj(sens_maps):
+                sens_maps = sens_maps.astype(np.complex64)
+            
+            return kspace, sens_maps
+
+    
+    def get_yshift(self, hf_file):
+        """Get the y_shift to be applied on reconstructed raw images.
+        
+        Handles both legacy format (out/Parameter/YRange) and new format (mrecon_header).
+        """
+        # Try legacy format
+        try:
+            tmp = hf_file['out']['Parameter']['YRange'][:]
+            if len(np.unique(tmp[0])) > 1 or len(np.unique(tmp[1])) > 1:
+                print('Warning: different y shifts for different echoes!')
+            return -int((tmp[0, 0] + tmp[1, 0]) / 2)
+        except:
+            pass
+        
+        # Try new format
+        try:
+            tmp = hf_file['mrecon_header']['Parameter']['YRange'][()]
+            if len(np.unique(tmp[0])) > 1 or len(np.unique(tmp[1])) > 1:
+                print('Warning: different y shifts for different echoes!')
+            return -int((tmp[0, 0] + tmp[1, 0]) / 2)
+        except:
+            pass
+        
+        # Default to 0 if not found
+        print("Could not read y_shift from file. Using 0.")
+        return 0
     
     def __len__(self):
         """Return total number of k-space points for training."""
@@ -105,8 +201,6 @@ class BrainDataset(Dataset):
             dict: sample containing coordinates and target k-space value
         """
         # Point-wise sampling for neural implicit k-space training
-        # TODO: set index = 0 for now to see if the dataset is working
-        index = 0
         sample = {
             'coords': self.kspace_coordinates_flat[index],  # 4D coordinates [echo, coil, kx, ky]
             'targets': self.kspace_data_flat[index]         # Target k-space value (complex)
@@ -114,31 +208,29 @@ class BrainDataset(Dataset):
         return sample
     
     def reconstruct_images(self, k_space):
-        """Reconstruct coil-combined images from k-space data.
-        
-        Uses the stored k-space data, coil sensitivity maps, and y-shift to
-        perform coil-combined reconstruction following the legacy approach.
-        
-        Returns:
-            np.ndarray: Reconstructed images (echoes, kx, ky) - complex valued
+        """Reconstruct coil-combined images for one or multiple slices.
+
+        Parameters
+        ----------
+        k_space : np.ndarray or torch.Tensor
+            K-space with shape (slices, echoes, coils, kx, ky)
+
+        Returns
+        -------
+        np.ndarray
+            Complex images with shape (slices, echoes, kx, ky)
         """
-        from utils.vis import compute_coil_combined_reconstructions
-        
-        # Use stored k-space and CSM (already unnormalized original data)
-        kspace = k_space  # (echoes, coils, kx, ky)
-        sens_maps = self.csm  # (coils, kx, ky)
+
+        # Use stored sensitivity maps and y-shift
+        kspace = k_space  # (slices, echoes, coils, kx, ky)
+        sens_maps = self.csm  # (slices, 1, coils, kx, ky_half or ky), may need padding
         y_shift = self.y_shift
-        
-        # Add batch dims for reconstruction function
-        # Function expects (slices, echoes, coils, kx, ky) and (slices, 1, coils, kx, ky)
-        kspace_batch = kspace[None]  # (1, echoes, coils, kx, ky)
-        sens_maps_batch = sens_maps[None, None]  # (1, 1, coils, kx, ky)
-        
-        # Reconstruct
+
+        # Reconstruct; utility handles padding and types
         img_recon = compute_coil_combined_reconstructions(
-            kspace_batch, sens_maps_batch, y_shift, remove_oversampling=True
+            kspace, sens_maps, y_shift, remove_oversampling=True
         )
-        
-        # Remove batch dim -> (echoes, kx, ky)
-        return img_recon[0]
+
+        # (slices, echoes, kx, ky)
+        return img_recon
 

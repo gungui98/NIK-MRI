@@ -3,7 +3,7 @@ import matplotlib
 import numpy as np
 import torch
 from utils.medutils_compat import center_crop
-from utils.mri import coilcombine, ifft2c_mri
+from utils.mri import coilcombine, ifft2c_mri, ifft2c
 from utils.medutils_compat import rss
 
 import os
@@ -109,47 +109,16 @@ def remove_readout_oversampling(data, nr_lines):
 
     return data[..., nr_lines:-nr_lines]
 
-
 def compute_coil_combined_reconstructions(kspace, sens_maps,
                                           y_shift, remove_oversampling=True):
-    """Compute coil combined reconstructions.
-
-    Accepts numpy arrays, performs reconstruction in torch, returns numpy.
-    """
-
-    # Convert inputs to torch tensors
-    if isinstance(kspace, np.ndarray):
-        kspace_t = torch.from_numpy(kspace)
-    else:
-        kspace_t = kspace
-
-    coil_imgs = ifft2c_mri(kspace_t)
-    coil_imgs = torch.roll(coil_imgs, shifts=y_shift, dims=-2)
-
-    # Prepare sensitivity maps
-    if isinstance(sens_maps, np.ndarray):
-        if sens_maps.ndim == 5:
-            # raw shape (S,1,C,Kx,Ky_half) -> pad to (S,1,C,Kx,Ky)
-            sens_maps_pad = pad_sensitivity_maps(sens_maps, kspace_t.shape)
-            sens_maps_np = sens_maps_pad
-        elif sens_maps.ndim == 3:
-            # already padded (C,Kx,Ky) -> expand slice/echo dims
-            sens_maps_np = sens_maps[None, None]
-        else:
-            raise ValueError(f"Unsupported sens_maps shape: {sens_maps.shape}")
-        sens_maps_t = torch.from_numpy(sens_maps_np)
-    else:
-        # torch.Tensor
-        if sens_maps.ndim == 3:
-            sens_maps_t = sens_maps[None, None]
-        else:
-            sens_maps_t = sens_maps
-    sens_maps_t = sens_maps_t.to(coil_imgs.device)
-    img_cc = torch.sum(coil_imgs * torch.conj(sens_maps_t), dim=2)
+    """Compute coil combined reconstructions."""
+    coil_imgs = ifft2c(kspace)
+    coil_imgs = np.roll(coil_imgs, shift=y_shift, axis=-2)
+    img_cc = np.sum(coil_imgs * np.conj(sens_maps), axis=2)
     if remove_oversampling:
-        tmp = int(img_cc.shape[-1] / 4)
-        img_cc = img_cc[..., tmp:-tmp]
-    return img_cc.detach().cpu().numpy()
+        img_cc = remove_readout_oversampling(img_cc,
+                                             int(img_cc.shape[-1] / 4))
+    return img_cc
 
 
 def load_coil_combined_reconstruction(file_path):

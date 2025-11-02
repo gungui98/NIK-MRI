@@ -251,7 +251,7 @@ def visualize_all_echoes(img_cc_fs, slice_idx=0, output_prefix="recon_echoes"):
 
 
 if __name__ == "__main__":
-    filename = "/Users/phinguyen/Documents/qMRI/data/helmholtz/val_recon/sub-07/t2s_gre_fr.hf"
+    filename = "/u/home/nguyv/Documents/data/helmholtz/val_recon/sub-07/t2s_gre_fr.hf"
     
     print("="*60)
     print("Legacy-style MRI Reconstruction Test")
