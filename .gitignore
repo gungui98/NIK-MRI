@@ -1,4 +1,5 @@
 wandb/
+outputs/
 model_checkpoints/
 *.pyo
 *.pyd
@@ -40,3 +41,4 @@ venv.bak/
 .python-version
 *.png
 *.gif
+logs/

@@ -1,12 +1,9 @@
-from typing import Any
-
-
 import os
 from torch.utils.data import Dataset
 import torch
 import numpy as np
 import h5py
-from utils.vis import load_brain_h5, pad_sensitivity_maps, compute_coil_combined_reconstructions
+from utils.vis import pad_sensitivity_maps, compute_coil_combined_reconstructions
 from utils.medutils_compat import rss
 
 
@@ -45,57 +42,85 @@ class BrainDataset(Dataset):
         if config['is_selected']:
             self.selected_slices = config['selected_slices']
             self.selected_echoes = config['selected_echoes']
-            self.selected_coils = config['selected_coils']
-            
-            # k_space_idx = np.ix_(self.selected_slices, self.selected_echoes, self.selected_coils)
-            # csm_idx = np.ix_(self.selected_slices, [0], self.selected_coils) # we only need one sensitivity map for reconstruction
-            # select all slices, echoes, and coils
-            k_space_idx = np.ix_(self.selected_slices, self.selected_echoes, self.selected_coils)
-            csm_idx = np.ix_(self.selected_slices, [0], self.selected_coils) # we only need one sensitivity map for reconstruction
+            # Coils will be dropped after SENSE combine; ignore any provided selection and warn
+            if 'selected_coils' in config and config['selected_coils'] is not None:
+                print('Warning: selected_coils provided but will be ignored due to coil combination.')
+
+            # Select slices and echoes; keep all coils for combination
+            k_space_idx = np.ix_(self.selected_slices, self.selected_echoes, np.arange(kspace.shape[2]))
+            csm_idx = np.ix_(self.selected_slices, [0], np.arange(csm.shape[2]))  # maps typically 1 echo
             kspace = kspace[k_space_idx]
             csm = csm[csm_idx]
+
+            # Renormalize selected coils: RSS across coils should be 1 to avoid spatial bias
+            csm_rss_selected = rss(csm, 2)
+            csm = np.nan_to_num(csm / csm_rss_selected[:, :, None, :, :])
+
+        # Perform SENSE coil combination to drop coil dimension
+        # 1) Reconstruct images per (slice, echo) using sensitivity maps
+        # 2) FFT back to k-space to get single-virtual-coil k-space
+        # compute_coil_combined_reconstructions returns (slices, echoes, kx, ky) complex image
+        kspace_t = torch.from_numpy(kspace)
+        csm_t = torch.from_numpy(csm)
+        img_combined = compute_coil_combined_reconstructions(kspace_t, csm_t, y_shift, remove_oversampling=True)
+
+        # Use centered numpy FFT to avoid linear phase ramps
+        img_np = img_combined.detach().cpu().numpy()
+        kspace_combined = np.fft.fftshift(
+            np.fft.fft2(
+                np.fft.ifftshift(img_np, axes=(-2, -1)),
+                axes=(-2, -1),
+                norm='ortho',
+            ),
+            axes=(-2, -1),
+        ).astype(np.complex64)
         
-        self.csm = csm
+        # Store combined representations; csm is no longer needed for dataset usage
+        self.csm = None
         self.y_shift = y_shift
-        self.kspace = kspace
+        self.kspace = kspace_combined
 
         # Flatten k-space data for point-wise training: [total_kpoints, 1]
-        self.kspace_data_flat = np.reshape(kspace.astype(np.complex64), (-1, 1))
+        self.kspace_data_flat = np.reshape(self.kspace.astype(np.complex64), (-1, 1))
 
         # Keep original k-space data shape for reference
-        self.kspace_data_original = kspace.astype(np.complex64)
+        self.kspace_data_original = self.kspace.astype(np.complex64)
         
         # Extract k-space dimensions
-        num_slices, num_echoes, num_coils, kx_dim, ky_dim = kspace.shape
+        num_slices, num_echoes, kx_dim, ky_dim = self.kspace.shape
+        self.num_slices = num_slices
+        self.num_echoes = num_echoes
+        self.num_coils = 1
+        self.kx_dim = kx_dim
+        self.ky_dim = ky_dim
         self.total_kpoints = self.kspace_data_flat.shape[0]
         
-        # Create 4D coordinate system [echo, coil, kx, ky] broadcast over slices
+        # Create 3D coordinate system [echo, kx, ky] broadcast over slices
         # Normalized to [-1, 1] per dimension
-        echo_lin = np.linspace(-1, 1, num_echoes, dtype=np.float32).reshape(1, num_echoes, 1, 1, 1)
-        coil_lin = np.linspace(-1, 1, num_coils, dtype=np.float32).reshape(1, 1, num_coils, 1, 1)
-        kx_lin = np.linspace(-1, 1, kx_dim, dtype=np.float32).reshape(1, 1, 1, kx_dim, 1)
-        ky_lin = np.linspace(-1, 1, ky_dim, dtype=np.float32).reshape(1, 1, 1, 1, ky_dim)
+        echo_lin = np.linspace(-1, 1, num_echoes, dtype=np.float32).reshape((1, num_echoes, 1, 1))
+        kx_lin = np.linspace(-1, 1, kx_dim, dtype=np.float32).reshape((1, 1, kx_dim, 1))
+        ky_lin = np.linspace(-1, 1, ky_dim, dtype=np.float32).reshape((1, 1, 1, ky_dim))
 
-        target_shape = (num_slices, num_echoes, num_coils, kx_dim, ky_dim)
+        target_shape = (num_slices, num_echoes, kx_dim, ky_dim)
         echo_grid = np.broadcast_to(echo_lin, target_shape)
-        coil_grid = np.broadcast_to(coil_lin, target_shape)
         kx_grid = np.broadcast_to(kx_lin, target_shape)
         ky_grid = np.broadcast_to(ky_lin, target_shape)
 
-        # Stack into last dim → (..., 4)
-        coords = np.stack([echo_grid, coil_grid, kx_grid, ky_grid], axis=-1)
+        # Stack into last dim → (..., 3)
+        coords = np.stack([echo_grid, kx_grid, ky_grid], axis=-1)
 
-        # Flatten coordinates for point-wise training: [total_kpoints, 4]
-        self.kspace_coordinates_flat = coords.reshape(-1, 4).astype(np.float32)
+        # Flatten coordinates for point-wise training: [total_kpoints, 3]
+        self.kspace_coordinates_flat = coords.reshape(-1, 3).astype(np.float32)
 
         # Normalize k-space data magnitude for stable training
         # Use same normalization strategy as cardiac dataset
-        self.kspace_data_flat = self.kspace_data_flat / (np.max(np.abs(self.kspace_data_flat)) + 1e-9)
+        self.norm_factor = np.max(np.abs(self.kspace_data_flat)) + 1e-9
+        self.kspace_data_flat = self.kspace_data_flat / self.norm_factor
 
         # Convert numpy arrays to PyTorch tensors for training
         # Note: device transfer handled in model, not here
         self.kspace_data_flat = torch.from_numpy(self.kspace_data_flat)      # shape: [total_kpoints, 1]
-        self.kspace_coordinates_flat = torch.from_numpy(self.kspace_coordinates_flat)  # shape: [total_kpoints, 4]
+        self.kspace_coordinates_flat = torch.from_numpy(self.kspace_coordinates_flat)  # shape: [total_kpoints, 3]
         
     def load_raw_data(self, filename):
         """Load raw data from h5 file."""
@@ -208,12 +233,12 @@ class BrainDataset(Dataset):
         return sample
     
     def reconstruct_images(self, k_space):
-        """Reconstruct coil-combined images for one or multiple slices.
+        """Reconstruct images from combined k-space (no coil dimension).
 
         Parameters
         ----------
         k_space : np.ndarray or torch.Tensor
-            K-space with shape (slices, echoes, coils, kx, ky)
+            K-space with shape (slices, echoes, kx, ky)
 
         Returns
         -------
@@ -221,16 +246,40 @@ class BrainDataset(Dataset):
             Complex images with shape (slices, echoes, kx, ky)
         """
 
-        # Use stored sensitivity maps and y-shift
-        kspace = k_space  # (slices, echoes, coils, kx, ky)
-        sens_maps = self.csm  # (slices, 1, coils, kx, ky_half or ky), may need padding
-        y_shift = self.y_shift
+        if not isinstance(k_space, torch.Tensor):
+            k = torch.from_numpy(k_space)
+        else:
+            k = k_space
 
-        # Reconstruct; utility handles padding and types
-        img_recon = compute_coil_combined_reconstructions(
-            kspace, sens_maps, y_shift, remove_oversampling=True
+        # Use centered numpy IFFT to avoid linear phase ramps
+        k_np = k.detach().cpu().numpy() if isinstance(k, torch.Tensor) else k
+        img = np.fft.ifft2(
+            np.fft.fftshift(k_np, axes=(-2, -1)),
+            axes=(-2, -1),
+            norm='ortho',
         )
+        img = np.fft.ifftshift(img, axes=(-2, -1))
+        return img.astype(np.complex64)
+    
+    def get_grid_coordinates(self):
+        """Get grid coordinates in the format expected by test_batch.
+        
+        Note: Grid coordinates are the same for all slices (they are broadcast over slices).
+        The coordinate system matches the dataset's training coordinate system exactly.
+            
+        Returns
+        -------
+        torch.Tensor
+            Grid coordinates with shape (num_echoes, kx_dim, ky_dim, 3)
+            in format [echo, kx, ky]
+        """
+        # Create coordinate grids matching the dataset's coordinate system
+        # Use same normalization as dataset: np.linspace(-1, 1, ...)
+        echo_lin = torch.linspace(-1, 1, self.num_echoes, dtype=torch.float32)
+        kx_lin = torch.linspace(-1, 1, self.kx_dim, dtype=torch.float32)
+        ky_lin = torch.linspace(-1, 1, self.ky_dim, dtype=torch.float32)
 
-        # (slices, echoes, kx, ky)
-        return img_recon
-
+        # Create meshgrid matching the coordinate order [echo, kx, ky]
+        grid = torch.stack(torch.meshgrid(echo_lin, kx_lin, ky_lin, indexing='ij'), dim=-1)
+        # Shape: (num_echoes, kx_dim, ky_dim, 3)
+        return grid

@@ -8,30 +8,47 @@ subject: sub-07  # Options: sub-07, sub-08, sub-09
 # If omitted, the first .h5/.hf under subject folder will be used
 file_name: t2s_gre_fr.hf
 # Optional coil selection (0-based indices). If omitted, use all coils
-is_selected: False # dont filter by selected slices, echoes, and coils if True
-selected_coils: [0,1,2,3]
-selected_echoes: [0,1,2,3]
-selected_slices: [14,15,16,17]  # Select slice from 0-35 (36 slices total)
-batch_size: 30000
-num_workers: 8
+is_selected: True # If True, filter by selected slices, echoes, and coils. If False, use all available.
+selected_coils: [0,1,2,3]  # Only these coils will be used when is_selected=True
+selected_echoes: [0,1,2,3]  # Only these echoes will be used when is_selected=True
+selected_slices: [14,15,16,17]  # Select slice from 0-35 (36 slices total). Only these slices will be used when is_selected=True
+batch_size: 300000
+num_workers: 4
 sample_per_epoch: 100
 
 # model config for mlp
 model: siren
-coord_dim: 4  # [echo, coil, kx, ky]
+coord_dim: 3  # [echo, coil, kx, ky]
 num_layers: 8
 feature_dim: 512
 out_dim: 1
 
 # train config
-num_steps: 100
+num_steps: 501
 lr: 3e-5
+# Learning rate scheduler options: 'cosine', 'step', 'exponential', 'plateau', or None
+lr_scheduler: cosine  # Recommended: cosine for smooth decay
+lr_min: 1e-6  # Minimum learning rate for cosine scheduler
+lr_gamma: 0.5  # Decay factor for step/exponential scheduler
+lr_step_size: 167  # Step size for step scheduler (num_steps / 3)
+# Gradient clipping for training stability (None to disable, or positive value)
+max_grad_norm: 1.0  # Clip gradients to this norm
 
 # loss config
-loss_type: hdr_ff  # Options: hdr_ff, weighted_l1
+# Options: 'hdr_ff', 'weighted_hdr', 'mixed', 'adaptive_hdr', 'mse'
+# Recommended: 'mixed' for better convergence, or 'weighted_hdr' for frequency-aware training
+loss_type: mixed  # Try 'mixed' first, then 'weighted_hdr' if needed
 hdr_eps: 1e-2
 hdr_ff_sigma: 1
 hdr_ff_factor: 0
+# For mixed loss:
+# Increased MSE/L1 weights to provide stronger absolute scale constraints
+# This prevents the model from predicting unrealistically small values
+mse_weight: 0.5  # Weight for MSE component in mixed loss (higher = stronger scale constraint)
+l1_weight: 0.3  # Weight for L1 component in mixed loss
+hdr_weight: 0.2  # Weight for HDR component in mixed loss (reduced to prevent scale collapse)
+# For weighted_hdr loss:
+low_freq_weight: 2.0  # Weight multiplier for low-frequency k-space regions
 
 # recon config
 # For brain dataset: echoes treated as temporal dimension; sizes validated at load

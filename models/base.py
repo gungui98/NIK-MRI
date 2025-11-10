@@ -4,7 +4,7 @@ import torch.nn as nn
 import numpy as np
 from abc import abstractmethod, ABC
 from utils.mri import ifft2c_mri, coilcombine
-from utils.loss import HDRLoss_FF, AdaptiveHDRLoss
+from utils.loss import HDRLoss_FF, AdaptiveHDRLoss, MixedLoss, WeightedHDRLoss_FF
 from datetime import datetime
 
 
@@ -80,10 +80,14 @@ class NIKBase(nn.Module, ABC):
         """
         if self.config['exp_summary'] == 'wandb':
             import wandb
+            # Set wandb directory to outputs/wandb_runs to avoid writing to src
+            wandb_dir = os.path.join('outputs', 'wandb_runs')
+            os.makedirs(wandb_dir, exist_ok=True)
             self.exp_summary = wandb.init(
                 project=self.config['wandb_project'], 
                 name=self.exp_id,
                 config=self.config,
+                dir=wandb_dir,  # Set directory for wandb run files
             )
 
     def exp_summary_log(self, log_dict):
@@ -105,8 +109,7 @@ class NIKBase(nn.Module, ABC):
 
         self.create_criterion()
         self.create_optimizer()
-
-        # TODO: add lr scheduler to training
+        self.create_lr_scheduler()
 
         exp_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.exp_id = exp_id
@@ -148,16 +151,54 @@ class NIKBase(nn.Module, ABC):
         # for param in self.named_parameters():
         #     print(param[0])
 
-    # TODO: add lr scheduler to training
-    # def create_lr_scheduler(self):
-    #     """Create the learning rate scheduler."""
-    #     self.lr_scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=10, gamma=0.5)
+    def create_lr_scheduler(self):
+        """Create the learning rate scheduler."""
+        scheduler_type = self.config.get('lr_scheduler', 'cosine').lower()
+        num_steps = self.config.get('num_steps', 500)
+        
+        if scheduler_type == 'cosine':
+            # Cosine annealing with warm restarts
+            T_max = num_steps
+            eta_min = float(self.config.get('lr_min', 1e-6))
+            self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                self.optimizer, T_max=T_max, eta_min=eta_min
+            )
+        elif scheduler_type == 'step':
+            step_size = self.config.get('lr_step_size', num_steps // 3)
+            gamma = float(self.config.get('lr_gamma', 0.5))
+            self.lr_scheduler = torch.optim.lr_scheduler.StepLR(
+                self.optimizer, step_size=step_size, gamma=gamma
+            )
+        elif scheduler_type == 'exponential':
+            gamma = float(self.config.get('lr_gamma', 0.995))
+            self.lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+                self.optimizer, gamma=gamma
+            )
+        elif scheduler_type == 'plateau':
+            # Reduce LR when loss plateaus
+            self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.optimizer, mode='min', factor=0.5, patience=50, verbose=True
+            )
+        else:
+            self.lr_scheduler = None
 
     def create_criterion(self):
         """Create the loss function."""
-        self.criterion = HDRLoss_FF(self.config)
-        # self.criterion = torch.nn.MSELoss()
-        # self.criterion = AdaptiveHDRLoss(self.config)
+        loss_type = self.config.get('loss_type', 'hdr_ff').lower()
+        
+        if loss_type == 'mixed':
+            self.criterion = MixedLoss(self.config)
+        elif loss_type == 'weighted_hdr':
+            self.criterion = WeightedHDRLoss_FF(self.config)
+        elif loss_type == 'hdr_ff':
+            self.criterion = HDRLoss_FF(self.config)
+        elif loss_type == 'adaptive_hdr':
+            self.criterion = AdaptiveHDRLoss(self.config)
+        elif loss_type == 'mse':
+            self.criterion = torch.nn.MSELoss()
+        else:
+            # Default to HDR
+            self.criterion = HDRLoss_FF(self.config)
 
     def pre_process(self, inputs):
         """
@@ -189,7 +230,14 @@ class NIKBase(nn.Module, ABC):
         self.optimizer.zero_grad()
         output = self.forward(sample['coords'])
         loss = self.criterion(output, sample['targets'], sample['coords'])
+        loss = loss[0] if isinstance(loss, tuple) else loss  # Handle tuple returns
         loss.backward()
+        
+        # Gradient clipping for stability
+        max_grad_norm = self.config.get('max_grad_norm', None)
+        if max_grad_norm is not None and max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(self.parameters(), max_grad_norm)
+        
         self.optimizer.step()
         return loss
 
