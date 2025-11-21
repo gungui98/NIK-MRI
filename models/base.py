@@ -129,7 +129,7 @@ class NIKBase(nn.Module, ABC):
             2. load the network parameters from the weight file path
         If you want to add more things, you can override this function.
         """
-        self.weightself.self.config['weight_path']
+        self.weight_path = self.config['weight_path']
         self.load_network()
         self.network.eval()
 
@@ -206,9 +206,13 @@ class NIKBase(nn.Module, ABC):
 
     def pre_process(self, inputs):
         """
-        Encodings the coordinates
-        If not implemented, it will return the coordinates as it is.
+        Preprocess the input coordinates.
+        Base implementation moves coordinates to device.
+        Subclasses should override to add model-specific encoding.
         """
+        inputs['coords'] = inputs['coords'].to(self.device)
+        if 'targets' in inputs:
+            inputs['targets'] = inputs['targets'].to(self.device)
         return inputs
 
     def post_process(self, output):
@@ -219,9 +223,19 @@ class NIKBase(nn.Module, ABC):
         return output
 
     def forward(self, inputs) -> torch.Tensor:
-        """Get the coordinates and return the output of the network with required shape."""
-        out = self.post_process(self.network(self.pre_process(inputs)))
-        return out
+        """
+        Forward pass through the network.
+        Expects inputs to be a dict with 'coords' key (or 'features' if pre_processed).
+        """
+        # If inputs is already pre-processed and has 'features', use it directly
+        if isinstance(inputs, dict) and 'features' in inputs:
+            return self.network(inputs['features'])
+        # Otherwise, pre-process first
+        processed = self.pre_process(inputs)
+        if 'features' in processed:
+            return self.network(processed['features'])
+        # Fallback: assume processed['coords'] can be passed directly to network
+        return self.network(processed['coords'])
 
     def train_batch(self, sample):
         """
@@ -229,14 +243,22 @@ class NIKBase(nn.Module, ABC):
         Args:
             sample: A batch of data formed as a dict. Must contain the following keys:
                 coords: The coordinates of the data.
-                target: The target of the data.
+                targets: The target of the data.
         """
         self.optimizer.zero_grad()
-        output = self.forward(sample['coords'])
+        sample = self.pre_process(sample)
+        output = self.forward(sample)
+        output = self.post_process(output)
         if hasattr(self.criterion, 'set_global_step'):
             self.criterion.set_global_step(self.global_step)
-        loss = self.criterion(output, sample['targets'], sample['coords'])
-        loss = loss[0] if isinstance(loss, tuple) else loss  # Handle tuple returns
+        loss_result = self.criterion(output, sample['targets'], sample['coords'])
+        
+        # Handle different loss return formats
+        if isinstance(loss_result, tuple):
+            loss = loss_result[0]
+        else:
+            loss = loss_result
+        
         loss.backward()
         
         # Gradient clipping for stability
@@ -248,63 +270,207 @@ class NIKBase(nn.Module, ABC):
         self.global_step += 1
         return loss
 
-    def test_batch(self, sample=None):
+    def test_batch(self, kspace_data_original=None, dataset=None):
         """
         Test the network with a cartesian grid.
-        if sample is not None, it will return image combined with coil sensitivity.
+        Uses grid coordinates from dataset if provided, otherwise constructs grid from config.
+        
+        Parameters
+        ----------
+        kspace_data_original : torch.Tensor or np.ndarray, optional
+            Original k-space data for shape inference
+        dataset : BrainDataset, optional
+            Dataset object to get grid coordinates from. If provided, uses its coordinate system.
+            
+        Returns
+        -------
+        torch.Tensor
+            Predicted k-space with shape:
+            - (num_slices, num_echoes, kx_dim, ky_dim) if dataset is provided with 4D coords
+            - (1, num_echoes, num_coils, kx_dim, ky_dim) if dataset is provided with legacy 3D coords
+            - (num_echoes, num_coils, kx_dim, ky_dim) if dataset is None (legacy behavior)
         """
         with torch.no_grad():
-            nt = self.config['nt']
-            nx = self.config['nx']
-            ny = self.config['ny']
-
-            ts = torch.linspace(-1+1/nt, 1-1/nt, nt)
-            kxs = torch.linspace(-1, 1-2/nx, nx)
-            kys = torch.linspace(-1, 1-2/ny, ny)
-            nc = len(self.config['coil_select'])
-            kc = torch.linspace(-1, 1, nc)
-
-            # TODO: disgard the outside coordinates before prediction
-            grid_coords = torch.stack(torch.meshgrid(ts, kxs, kys, kc, indexing='ij'), -1).to(self.device) # nt, nx, ny, nc, 4
-            dist_to_center = torch.sqrt(grid_coords[:,:,:,:,1]**2 + grid_coords[:,:,:,:,2]**2)
-
-            # split t for memory saving
-            t_split = 3
-            t_split_num = np.ceil(nt / t_split).astype(int)
-
-            kpred_list = []
-            for t_batch in range(t_split_num):
-                grid_coords_batch = grid_coords[t_batch*t_split:(t_batch+1)*t_split]
-
-                grid_coords_batch = grid_coords_batch.reshape(-1, 4).requires_grad_(False)
-                # get prediction
-                kpred_batch = self.forward(grid_coords_batch)
-                kpred.append(kpred_batch)
-            kpred = torch.concat(kpred, 0)
+            # Initialize format flags
+            new_format = False
+            coil_less = False
+            ns = None
+            ne = None
+            nt = None
+            nc = None
             
-            kpred_list.append(kpred)
-            kpred = torch.mean(torch.stack(kpred_list, 0), 0) #* filter_value.reshape(-1, 1)
+            # Use grid from dataset if provided
+            if dataset is not None:
+                if hasattr(dataset, 'get_grid_coordinates'):
+                    grid_coords = dataset.get_grid_coordinates().to(self.device)
+                    # grid_coords shape (brain, new format): (num_slices, kx_dim, ky_dim, num_echoes, 4)
+                    if grid_coords.shape[-1] == 4 and len(grid_coords.shape) == 5:
+                        ns, nx, ny, ne = grid_coords.shape[:4]
+                        nc = 1
+                        coil_less = True
+                        new_format = True
+                    elif grid_coords.shape[-1] == 3:
+                        # Legacy 3D format: (num_echoes, kx_dim, ky_dim, 3)
+                        nt, nx, ny = grid_coords.shape[:3]
+                        nc = 1
+                        coil_less = True
+                        new_format = False
+                    else:
+                        # legacy path with coils: (num_echoes, num_coils, kx_dim, ky_dim, 4)
+                        nt, nc, nx, ny = grid_coords.shape[:4]
+                        coil_less = False
+                        new_format = False
+                else:
+                    raise ValueError("Dataset does not have get_grid_coordinates method. Use BrainDataset or provide grid manually.")
+            else:
+                # Fallback to original implementation using config
+                nt = self.config['nt']
+                nx = self.config['nx']
+                ny = self.config['ny']
 
+                ts = torch.linspace(-1+1/nt, 1-1/nt, nt)
+                # Infer coil dimension
+                if kspace_data_original is not None:
+                    # Support numpy arrays and torch tensors
+                    try:
+                        nc = int(kspace_data_original.shape[1])
+                    except Exception as e:
+                        raise ValueError("kspace_data_original must have a shape with coil at dim=1") from e
+                elif self.config.get('coil_select'):
+                    nc = len(self.config['coil_select'])
+                elif 'nc' in self.config:
+                    nc = int(self.config['nc'])
+                else:
+                    raise ValueError("Cannot infer number of coils (nc). Provide kspace_data_original, dataset, or set coil_select/nc in config.")
+                kc = torch.linspace(-1, 1, nc)
+                kxs = torch.linspace(-1, 1-2/nx, nx)
+                kys = torch.linspace(-1, 1-2/ny, ny)
+                
+                grid_coords = torch.stack(torch.meshgrid(ts, kc, kxs, kys, indexing='ij'), -1).to(self.device) # nt, nc, nx, ny, 4
 
-            # TODO: clearning this part of code
-            if sample is not None:
-                sensitivity_map = sample['sensitivity_map']
+            # Compute distance to center for masking
+            if new_format:
+                # New 4D format: [slice, kx, ky, echo] - kx, ky at indices 1, 2
+                dist_to_center = torch.sqrt(grid_coords[:,:,:,:,1]**2 + grid_coords[:,:,:,:,2]**2)
+            elif coil_less:
+                # Legacy 3D format: kx, ky at indices 1,2
+                dist_to_center = torch.sqrt(grid_coords[:,:,:,1]**2 + grid_coords[:,:,:,2]**2)
+            else:
+                # legacy: kx, ky at indices 2,3
+                dist_to_center = torch.sqrt(grid_coords[:,:,:,:,2]**2 + grid_coords[:,:,:,:,3]**2)
 
-                kpred = kpred.reshape(nt, nx, ny, -1)
-                k_outer = 1
-                kpred[dist_to_center>=k_outer] = 0
-                kpred = kpred.permute(0, 3, 1, 2)
-                coil_img = ifft2c_mri(kpred)
+            # Flatten coordinates for prediction
+            if new_format:
+                # New 4D format: (num_slices, kx_dim, ky_dim, num_echoes, 4)
+                grid_coords_flat = grid_coords.reshape(-1, 4).requires_grad_(False)
+                # Process all at once (or split if memory is an issue)
+                sample = {'coords': grid_coords_flat}
+                sample = self.pre_process(sample)
+                kpred = self.forward(sample)
+                kpred = self.post_process(kpred)
+                # Reshape to (num_slices, kx_dim, ky_dim, num_echoes) then permute to (num_slices, num_echoes, kx_dim, ky_dim)
+                kpred = kpred.reshape(ns, nx, ny, ne)
+                kpred = kpred.permute(0, 3, 1, 2)  # (num_slices, num_echoes, kx_dim, ky_dim)
+            else:
+                # Legacy format: split t (echoes) for memory saving
+                if coil_less:
+                    t_split = 1
+                    t_split_num = np.ceil(nt / t_split).astype(int)
+                else:
+                    t_split = 1
+                    t_split_num = np.ceil(nt / t_split).astype(int)
 
-                k_img = kpred[:,0,:,:].abs().unsqueeze(1).detach().cpu().numpy()        # nt, nx, ny   
-                # combined_img_motion = coil_img_motion.abs()
-                combined_img = coilcombine(coil_img, coil_dim=1, csm=sensitivity_map)
-                combined_phase = torch.angle(combined_img).detach().cpu().numpy()
-                combined_mag = combined_img.abs()
-                k_img = np.log(np.abs(k_img) + 1e-4)
+                kpred_list = []
+                for t_batch in range(t_split_num):
+                    grid_coords_batch = grid_coords[t_batch*t_split:(t_batch+1)*t_split]
 
-
-            return kpred, combined_img
+                    # Flatten coordinates appropriately
+                    if 'coil_less' in locals() and coil_less:
+                        grid_coords_batch = grid_coords_batch.reshape(-1, 3).requires_grad_(False)
+                    else:
+                        grid_coords_batch = grid_coords_batch.reshape(-1, 4).requires_grad_(False)
+                    # get prediction
+                    sample = {'coords': grid_coords_batch}
+                    sample = self.pre_process(sample)
+                    kpred_batch = self.forward(sample)
+                    kpred_batch = self.post_process(kpred_batch)
+                    kpred_list.append(kpred_batch)
+                kpred = torch.concat(kpred_list, 0)
+                
+                # Reshape prediction
+                if coil_less:
+                    kpred = kpred.reshape(nt, nx, ny)
+                else:
+                    kpred = kpred.reshape(nt, nc, nx, ny)
+            
+            # Mask outer k-space points (optional)
+            # Get masking configuration from config, with defaults
+            k_mask_enabled = self.config.get('k_mask_enabled', False)  # Enable/disable masking (default: False for full k-space)
+            k_mask_type = self.config.get('k_mask_type', 'rectangular')  # 'circular', 'rectangular', or 'elliptical'
+            k_outer = self.config.get('k_outer', 1.0)  # Outer radius/threshold
+            
+            if k_mask_enabled:
+                if k_mask_type == 'circular':
+                    # Circular mask: dist_to_center >= k_outer
+                    # Note: This will appear as an oval if nx != ny (rectangular grid)
+                    if new_format:
+                        kpred = kpred.permute(0, 2, 3, 1)  # (num_slices, kx_dim, ky_dim, num_echoes) for masking
+                        kpred[dist_to_center>=k_outer] = 0
+                        kpred = kpred.permute(0, 3, 1, 2)  # Back to (num_slices, num_echoes, kx_dim, ky_dim)
+                    else:
+                        kpred[dist_to_center>=k_outer] = 0
+                elif k_mask_type == 'rectangular':
+                    # Rectangular mask: max(|kx|, |ky|) >= k_outer
+                    if new_format:
+                        kx_coords = grid_coords[:,:,:,:,1].abs()
+                        ky_coords = grid_coords[:,:,:,:,2].abs()
+                        mask = torch.maximum(kx_coords, ky_coords) >= k_outer
+                        kpred = kpred.permute(0, 2, 3, 1)  # (num_slices, kx_dim, ky_dim, num_echoes) for masking
+                        kpred[mask] = 0
+                        kpred = kpred.permute(0, 3, 1, 2)  # Back to (num_slices, num_echoes, kx_dim, ky_dim)
+                    elif 'coil_less' in locals() and coil_less:
+                        kx_coords = grid_coords[:,:,:,1].abs()
+                        ky_coords = grid_coords[:,:,:,2].abs()
+                        mask = torch.maximum(kx_coords, ky_coords) >= k_outer
+                        kpred[mask] = 0
+                    else:
+                        kx_coords = grid_coords[:,:,:,:,2].abs()
+                        ky_coords = grid_coords[:,:,:,:,3].abs()
+                        mask = torch.maximum(kx_coords, ky_coords) >= k_outer
+                        kpred[mask] = 0
+                elif k_mask_type == 'elliptical':
+                    # Elliptical mask accounting for aspect ratio
+                    # Normalize by aspect ratio so it appears circular on rectangular grid
+                    aspect_ratio = ny / nx if nx > 0 else 1.0
+                    if new_format:
+                        kx_coords = grid_coords[:,:,:,:,1]
+                        ky_coords = grid_coords[:,:,:,:,2]
+                        dist_to_center_ellipse = torch.sqrt(kx_coords**2 + (ky_coords * aspect_ratio)**2)
+                        kpred = kpred.permute(0, 2, 3, 1)  # (num_slices, kx_dim, ky_dim, num_echoes) for masking
+                        kpred[dist_to_center_ellipse>=k_outer] = 0
+                        kpred = kpred.permute(0, 3, 1, 2)  # Back to (num_slices, num_echoes, kx_dim, ky_dim)
+                    elif coil_less:
+                        kx_coords = grid_coords[:,:,:,1]
+                        ky_coords = grid_coords[:,:,:,2]
+                        dist_to_center_ellipse = torch.sqrt(kx_coords**2 + (ky_coords * aspect_ratio)**2)
+                        kpred[dist_to_center_ellipse>=k_outer] = 0
+                    else:
+                        kx_coords = grid_coords[:,:,:,:,2]
+                        ky_coords = grid_coords[:,:,:,:,3]
+                        dist_to_center_ellipse = torch.sqrt(kx_coords**2 + (ky_coords * aspect_ratio)**2)
+                        kpred[dist_to_center_ellipse>=k_outer] = 0
+                else:
+                    raise ValueError(f"Unknown k_mask_type: {k_mask_type}. Must be 'circular', 'rectangular', or 'elliptical'")
+            
+            # For legacy format, add slice dimension if dataset was provided (for compatibility with reconstruct_images)
+            # New format already has correct shape (num_slices, num_echoes, kx_dim, ky_dim)
+            if dataset is not None and not new_format:
+                if coil_less:
+                    kpred = kpred.unsqueeze(0)  # (1, nt, nx, ny)
+                else:
+                    kpred = kpred.unsqueeze(0)  # (1, nt, nc, nx, ny)
+            
+            return kpred
     
 
 
