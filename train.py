@@ -7,6 +7,7 @@ import numpy as np
 from torch.utils.data import DataLoader
 
 from models.siren import NIKSiren
+from models.nerf import NIKNeRF
 # from models.insngp_tcnn import NIKHashSiren
 from utils.basic import parse_config
 from datasets.brain import BrainDataset
@@ -17,7 +18,13 @@ class Trainer:
         self.config = config
         self.dataset = BrainDataset(config)
         self.dataloader = DataLoader(self.dataset, batch_size=config['batch_size'], shuffle=True, num_workers=config['num_workers'])
-        self.NIKmodel = NIKSiren(config)
+        
+        model_type = config.get('model', 'nerf').lower()
+        if model_type == 'nerf':
+            self.NIKmodel = NIKNeRF(config)
+        else:
+            self.NIKmodel = NIKSiren(config)
+            
         self.NIKmodel.init_train()
         self.output_dir = os.path.join('outputs', self.NIKmodel.exp_id)
         os.makedirs(self.output_dir, exist_ok=True)

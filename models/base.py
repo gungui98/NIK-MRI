@@ -90,6 +90,19 @@ class NIKBase(nn.Module, ABC):
                 config=self.config,
                 dir=wandb_dir,  # Set directory for wandb run files
             )
+            
+            # Watch the model to log gradients and parameters during training
+            if self.network is not None:
+                watch_log = self.config.get('wandb_watch_log', 'gradients')  # 'gradients', 'parameters', 'all', or None
+                watch_freq = self.config.get('wandb_watch_freq', 100)  # Log every N steps
+                log_graph = self.config.get('wandb_watch_log_graph', False)  # Log computation graph
+                
+                self.exp_summary.watch(
+                    self.network,
+                    log=watch_log,
+                    log_freq=watch_freq,
+                    log_graph=log_graph
+                )
 
     def exp_summary_log(self, log_dict):
         """Log the summary to the visualization tools."""
@@ -147,11 +160,7 @@ class NIKBase(nn.Module, ABC):
 
     def create_optimizer(self):
         """Create the optimizer."""
-        # self.optimizer = torch.optim.Adam([self.parameters(), self.network.parameters()], lr=self.config['lr'])
-        # TODO: NEED TO CHECK IF THIS IS CORRECT
         self.optimizer = torch.optim.Adam(self.parameters(), lr=float(self.config['lr']))
-        # for param in self.named_parameters():
-        #     print(param[0])
 
     def create_lr_scheduler(self):
         """Create the learning rate scheduler."""

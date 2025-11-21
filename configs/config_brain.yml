@@ -17,7 +17,7 @@ num_workers: 4
 sample_per_epoch: 100
 
 # model config for mlp
-model: siren
+model: nerf
 coord_dim: 4  # [slice, kx, ky, echo]
 num_layers: 8
 feature_dim: 512
@@ -27,7 +27,7 @@ omega0_first: 60.0
 omega0_hidden: 1.0
 
 # train config
-num_epochs: 11
+num_epochs: 1001
 lr: 3e-5
 # Learning rate scheduler options: 'cosine', 'step', 'exponential', 'plateau', or None
 lr_scheduler: cosine  # Recommended: cosine for smooth decay
