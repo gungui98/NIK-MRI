@@ -4,7 +4,7 @@ import torch.nn as nn
 import numpy as np
 from abc import abstractmethod, ABC
 from utils.mri import ifft2c_mri, coilcombine
-from utils.loss import HDRLoss_FF, AdaptiveHDRLoss, MixedLoss, WeightedHDRLoss_FF
+from utils.loss import HDRLoss_FF, AdaptiveHDRLoss, MixedLoss, WeightedHDRLoss_FF, ComplexSpectralLoss
 from datetime import datetime
 
 
@@ -50,6 +50,7 @@ class NIKBase(nn.Module, ABC):
         self.lr_scheduler = None
         self.exp_id = None
         self.exp_summary = None
+        self.global_step = 0
 
         # needed for testing
         self.weight_path = None
@@ -110,6 +111,7 @@ class NIKBase(nn.Module, ABC):
         self.create_criterion()
         self.create_optimizer()
         self.create_lr_scheduler()
+        self.global_step = 0
 
         exp_id = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}"
         self.exp_id = exp_id
@@ -154,17 +156,17 @@ class NIKBase(nn.Module, ABC):
     def create_lr_scheduler(self):
         """Create the learning rate scheduler."""
         scheduler_type = self.config.get('lr_scheduler', 'cosine').lower()
-        num_steps = self.config.get('num_steps', 500)
+        num_epochs = self.config.get('num_epochs', 500)
         
         if scheduler_type == 'cosine':
             # Cosine annealing with warm restarts
-            T_max = num_steps
+            T_max = num_epochs
             eta_min = float(self.config.get('lr_min', 1e-6))
             self.lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer, T_max=T_max, eta_min=eta_min
             )
         elif scheduler_type == 'step':
-            step_size = self.config.get('lr_step_size', num_steps // 3)
+            step_size = self.config.get('lr_step_size', num_epochs // 3)
             gamma = float(self.config.get('lr_gamma', 0.5))
             self.lr_scheduler = torch.optim.lr_scheduler.StepLR(
                 self.optimizer, step_size=step_size, gamma=gamma
@@ -194,6 +196,8 @@ class NIKBase(nn.Module, ABC):
             self.criterion = HDRLoss_FF(self.config)
         elif loss_type == 'adaptive_hdr':
             self.criterion = AdaptiveHDRLoss(self.config)
+        elif loss_type == 'complex_spectral':
+            self.criterion = ComplexSpectralLoss(self.config)
         elif loss_type == 'mse':
             self.criterion = torch.nn.MSELoss()
         else:
@@ -229,6 +233,8 @@ class NIKBase(nn.Module, ABC):
         """
         self.optimizer.zero_grad()
         output = self.forward(sample['coords'])
+        if hasattr(self.criterion, 'set_global_step'):
+            self.criterion.set_global_step(self.global_step)
         loss = self.criterion(output, sample['targets'], sample['coords'])
         loss = loss[0] if isinstance(loss, tuple) else loss  # Handle tuple returns
         loss.backward()
@@ -239,6 +245,7 @@ class NIKBase(nn.Module, ABC):
             torch.nn.utils.clip_grad_norm_(self.parameters(), max_grad_norm)
         
         self.optimizer.step()
+        self.global_step += 1
         return loss
 
     def test_batch(self, sample=None):

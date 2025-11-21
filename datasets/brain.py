@@ -11,7 +11,7 @@ class BrainDataset(Dataset):
     """Dataset for loading and processing multi-echo brain MRI k-space data.
     
     This dataset handles Cartesian k-space brain MRI data with multiple echoes,
-    converting 4D coordinates (echo, coil, kx, ky) to flattened format for training.
+    converting 4D coordinates (slice, kx, ky, echo) to flattened format for training.
     """
     def __init__(self, config):
         super().__init__()
@@ -81,7 +81,7 @@ class BrainDataset(Dataset):
         self.kspace = kspace_combined
 
         # Flatten k-space data for point-wise training: [total_kpoints, 1]
-        self.kspace_data_flat = np.reshape(self.kspace.astype(np.complex64), (-1, 1))
+        self.kspace_data_flat = np.reshape(self.kspace.astype(np.complex64), (-1,))
 
         # Keep original k-space data shape for reference
         self.kspace_data_original = self.kspace.astype(np.complex64)
@@ -95,32 +95,43 @@ class BrainDataset(Dataset):
         self.ky_dim = ky_dim
         self.total_kpoints = self.kspace_data_flat.shape[0]
         
-        # Create 3D coordinate system [echo, kx, ky] broadcast over slices
+        # Create 4D coordinate system [slice, kx, ky, echo]
         # Normalized to [-1, 1] per dimension
-        echo_lin = np.linspace(-1, 1, num_echoes, dtype=np.float32).reshape((1, num_echoes, 1, 1))
-        kx_lin = np.linspace(-1, 1, kx_dim, dtype=np.float32).reshape((1, 1, kx_dim, 1))
-        ky_lin = np.linspace(-1, 1, ky_dim, dtype=np.float32).reshape((1, 1, 1, ky_dim))
+        slice_lin = np.linspace(-1, 1, num_slices, dtype=np.float32).reshape((num_slices, 1, 1, 1))
+        kx_lin = np.linspace(-1, 1, kx_dim, dtype=np.float32).reshape((1, kx_dim, 1, 1))
+        ky_lin = np.linspace(-1, 1, ky_dim, dtype=np.float32).reshape((1, 1, ky_dim, 1))
+        echo_lin = np.linspace(-1, 1, num_echoes, dtype=np.float32).reshape((1, 1, 1, num_echoes))
 
-        target_shape = (num_slices, num_echoes, kx_dim, ky_dim)
-        echo_grid = np.broadcast_to(echo_lin, target_shape)
+        target_shape = (num_slices, kx_dim, ky_dim, num_echoes)
+        slice_grid = np.broadcast_to(slice_lin, target_shape)
         kx_grid = np.broadcast_to(kx_lin, target_shape)
         ky_grid = np.broadcast_to(ky_lin, target_shape)
+        echo_grid = np.broadcast_to(echo_lin, target_shape)
 
-        # Stack into last dim → (..., 3)
-        coords = np.stack([echo_grid, kx_grid, ky_grid], axis=-1)
+        # Stack into last dim → (..., 4)
+        coords = np.stack([slice_grid, kx_grid, ky_grid, echo_grid], axis=-1)
 
-        # Flatten coordinates for point-wise training: [total_kpoints, 3]
-        self.kspace_coordinates_flat = coords.reshape(-1, 3).astype(np.float32)
+        # Flatten coordinates for point-wise training: [total_kpoints, 4]
+        self.kspace_coordinates_flat = coords.reshape(-1, 4).astype(np.float32)
 
-        # Normalize k-space data magnitude for stable training
-        # Use same normalization strategy as cardiac dataset
-        self.norm_factor = np.max(np.abs(self.kspace_data_flat)) + 1e-9
-        self.kspace_data_flat = self.kspace_data_flat / self.norm_factor
+        # Complex standardization: ensure std(Re) = std(Im) = 1
+        real = self.kspace_data_flat.real
+        imag = self.kspace_data_flat.imag
+        self.real_mean = float(real.mean())
+        self.imag_mean = float(imag.mean())
+        self.real_std = float(real.std() + 1e-9)
+        self.imag_std = float(imag.std() + 1e-9)
+        real_norm = (real - self.real_mean) / self.real_std
+        imag_norm = (imag - self.imag_mean) / self.imag_std
+        normalized_complex = real_norm + 1j * imag_norm
+        self.kspace_data_flat = normalized_complex.astype(np.complex64)
+        # Legacy attribute retained for compatibility (set to None -> skip scalar rescaling)
+        self.norm_factor = None
 
         # Convert numpy arrays to PyTorch tensors for training
         # Note: device transfer handled in model, not here
-        self.kspace_data_flat = torch.from_numpy(self.kspace_data_flat)      # shape: [total_kpoints, 1]
-        self.kspace_coordinates_flat = torch.from_numpy(self.kspace_coordinates_flat)  # shape: [total_kpoints, 3]
+        self.kspace_data_flat = torch.from_numpy(self.kspace_data_flat).unsqueeze(-1)      # shape: [total_kpoints, 1]
+        self.kspace_coordinates_flat = torch.from_numpy(self.kspace_coordinates_flat)  # shape: [total_kpoints, 4]
         
     def load_raw_data(self, filename):
         """Load raw data from h5 file."""
@@ -227,10 +238,23 @@ class BrainDataset(Dataset):
         """
         # Point-wise sampling for neural implicit k-space training
         sample = {
-            'coords': self.kspace_coordinates_flat[index],  # 4D coordinates [echo, coil, kx, ky]
+            'coords': self.kspace_coordinates_flat[index],  # 4D coordinates [slice, kx, ky, echo]
             'targets': self.kspace_data_flat[index]         # Target k-space value (complex)
         }
         return sample
+
+    def denormalize_kspace(self, k_space):
+        """Convert normalized predictions back to the original complex scale."""
+        if not hasattr(self, 'real_std'):
+            return k_space
+        if isinstance(k_space, torch.Tensor):
+            real = k_space.real * self.real_std + self.real_mean
+            imag = k_space.imag * self.imag_std + self.imag_mean
+            return torch.complex(real, imag)
+        else:
+            real = np.real(k_space) * self.real_std + self.real_mean
+            imag = np.imag(k_space) * self.imag_std + self.imag_mean
+            return real + 1j * imag
     
     def reconstruct_images(self, k_space):
         """Reconstruct images from combined k-space (no coil dimension).
@@ -264,22 +288,22 @@ class BrainDataset(Dataset):
     def get_grid_coordinates(self):
         """Get grid coordinates in the format expected by test_batch.
         
-        Note: Grid coordinates are the same for all slices (they are broadcast over slices).
         The coordinate system matches the dataset's training coordinate system exactly.
             
         Returns
         -------
         torch.Tensor
-            Grid coordinates with shape (num_echoes, kx_dim, ky_dim, 3)
-            in format [echo, kx, ky]
+            Grid coordinates with shape (num_slices, kx_dim, ky_dim, num_echoes, 4)
+            in format [slice, kx, ky, echo]
         """
         # Create coordinate grids matching the dataset's coordinate system
         # Use same normalization as dataset: np.linspace(-1, 1, ...)
-        echo_lin = torch.linspace(-1, 1, self.num_echoes, dtype=torch.float32)
+        slice_lin = torch.linspace(-1, 1, self.num_slices, dtype=torch.float32)
         kx_lin = torch.linspace(-1, 1, self.kx_dim, dtype=torch.float32)
         ky_lin = torch.linspace(-1, 1, self.ky_dim, dtype=torch.float32)
+        echo_lin = torch.linspace(-1, 1, self.num_echoes, dtype=torch.float32)
 
-        # Create meshgrid matching the coordinate order [echo, kx, ky]
-        grid = torch.stack(torch.meshgrid(echo_lin, kx_lin, ky_lin, indexing='ij'), dim=-1)
-        # Shape: (num_echoes, kx_dim, ky_dim, 3)
+        # Create meshgrid matching the coordinate order [slice, kx, ky, echo]
+        grid = torch.stack(torch.meshgrid(slice_lin, kx_lin, ky_lin, echo_lin, indexing='ij'), dim=-1)
+        # Shape: (num_slices, kx_dim, ky_dim, num_echoes, 4)
         return grid

@@ -18,43 +18,51 @@ sample_per_epoch: 100
 
 # model config for mlp
 model: siren
-coord_dim: 3  # [echo, coil, kx, ky]
+coord_dim: 4  # [slice, kx, ky, echo]
 num_layers: 8
 feature_dim: 512
 out_dim: 1
+use_polar_inputs: True  # Append [r, theta] to inputs for angular structure
+omega0_first: 60.0
+omega0_hidden: 1.0
 
 # train config
-num_steps: 501
+num_epochs: 11
 lr: 3e-5
 # Learning rate scheduler options: 'cosine', 'step', 'exponential', 'plateau', or None
 lr_scheduler: cosine  # Recommended: cosine for smooth decay
 lr_min: 1e-6  # Minimum learning rate for cosine scheduler
 lr_gamma: 0.5  # Decay factor for step/exponential scheduler
-lr_step_size: 167  # Step size for step scheduler (num_steps / 3)
+lr_step_size: 167  # Step size for step scheduler (num_epochs / 3)
 # Gradient clipping for training stability (None to disable, or positive value)
 max_grad_norm: 1.0  # Clip gradients to this norm
 
 # loss config
-# Options: 'hdr_ff', 'weighted_hdr', 'mixed', 'adaptive_hdr', 'mse'
-# Recommended: 'mixed' for better convergence, or 'weighted_hdr' for frequency-aware training
-loss_type: mixed  # Try 'mixed' first, then 'weighted_hdr' if needed
+# Options: 'hdr_ff', 'weighted_hdr', 'mixed', 'adaptive_hdr', 'mse', 'complex_spectral'
+# Recommended for spectral underfitting: 'complex_spectral'
+loss_type: complex_spectral
+
+# ComplexSpectralLoss params
+lambda_k: 1.0
+lambda_angle: 0.2
+lambda_log: 0.1
+radial_alpha: 1.5
+use_radial_weight: True
+spectral_eps: 1e-6
+lambda_angle_start: 0.05
+lambda_log_start: 0.02
+spectral_warmup_steps: 200
+
+# Legacy HDR params (kept for compatibility if switching losses)
 hdr_eps: 1e-2
 hdr_ff_sigma: 1
 hdr_ff_factor: 0
-# For mixed loss:
-# Increased MSE/L1 weights to provide stronger absolute scale constraints
-# This prevents the model from predicting unrealistically small values
-mse_weight: 0.5  # Weight for MSE component in mixed loss (higher = stronger scale constraint)
-l1_weight: 0.3  # Weight for L1 component in mixed loss
-hdr_weight: 0.2  # Weight for HDR component in mixed loss (reduced to prevent scale collapse)
-# For weighted_hdr loss:
-low_freq_weight: 2.0  # Weight multiplier for low-frequency k-space regions
+low_freq_weight: 2.0
 
 # recon config
 # For brain dataset: echoes treated as temporal dimension; sizes validated at load
-nt: 12  # number of echoes (validated from file)
-nx: 92  # k-space x dimension (validated from file)
-ny: 224  # k-space y dimension (may include oversampling)
+kx: 92  # k-space x dimension (validated from file)
+ky: 224  # k-space y dimension (may include oversampling)
 
 # experiment summary config
 exp_summary: wandb

@@ -8,7 +8,10 @@ from .base import NIKBase
 class NIKSiren(NIKBase):
     def __init__(self, config) -> None:
         super().__init__(config)
-        B = torch.randn((self.config['coord_dim'], self.config['feature_dim']//2), dtype=torch.float32)
+        # Optionally include polar coordinates [r, theta] in the encoded inputs
+        self.use_polar_inputs = bool(self.config.get('use_polar_inputs', False))
+        input_coord_dim = int(self.config['coord_dim']) + (2 if self.use_polar_inputs else 0)
+        B = torch.randn((input_coord_dim, self.config['feature_dim']//2), dtype=torch.float32)
         self.register_buffer('B', B)
         self.create_network()
         self.to(self.device)
@@ -18,7 +21,11 @@ class NIKSiren(NIKBase):
         feature_dim = self.config["feature_dim"]
         num_layers = self.config["num_layers"]
         out_dim = self.config["out_dim"]
-        self.network = Siren(feature_dim, num_layers, out_dim).to(self.device)
+        omega0_first = float(self.config.get("omega0_first", 60.0))
+        omega0_hidden = float(self.config.get("omega0_hidden", 1.0))
+        self.network = Siren(feature_dim, num_layers, out_dim,
+                             omega_0_first=omega0_first,
+                             omega_0_hidden=omega0_hidden).to(self.device)
 
     def pre_process(self, inputs):
         """
@@ -27,8 +34,17 @@ class NIKSiren(NIKBase):
         inputs['coords'] = inputs['coords'].to(self.device)
         if inputs.keys().__contains__('targets'):
             inputs['targets'] = inputs['targets'].to(self.device)
-        features = torch.cat([torch.sin(inputs['coords'] @ self.B),
-                              torch.cos(inputs['coords'] @ self.B)] , dim=-1)
+        coords = inputs['coords']
+        if self.use_polar_inputs:
+            # kx, ky are at indices 1, 2 in [slice, kx, ky, echo] coordinate system
+            kx = coords[..., 1]
+            ky = coords[..., 2]
+            r = torch.sqrt(kx * kx + ky * ky)
+            theta = torch.atan2(ky, kx)
+            aug_coords = torch.stack([r, theta], dim=-1)
+            coords = torch.cat([coords, aug_coords], dim=-1)
+        features = torch.cat([torch.sin(coords @ self.B),
+                              torch.cos(coords @ self.B)] , dim=-1)
         inputs['features'] = features
         return inputs
     
@@ -45,6 +61,8 @@ class NIKSiren(NIKBase):
         sample = self.pre_process(sample)
         output = self.forward(sample)
         output = self.post_process(output)
+        if hasattr(self.criterion, 'set_global_step'):
+            self.criterion.set_global_step(self.global_step)
         loss_result = self.criterion(output, sample['targets'], sample['coords'])
         
         # Handle different loss return formats
@@ -61,6 +79,7 @@ class NIKSiren(NIKBase):
             torch.nn.utils.clip_grad_norm_(self.parameters(), max_grad_norm)
         
         self.optimizer.step()
+        self.global_step += 1
         return loss
     
     def test_batch(self, kspace_data_original=None, dataset=None):
@@ -79,23 +98,40 @@ class NIKSiren(NIKBase):
         -------
         torch.Tensor
             Predicted k-space with shape:
-            - (1, num_echoes, num_coils, kx_dim, ky_dim) if dataset is provided
+            - (num_slices, num_echoes, kx_dim, ky_dim) if dataset is provided with 4D coords
+            - (1, num_echoes, num_coils, kx_dim, ky_dim) if dataset is provided with legacy 3D coords
             - (num_echoes, num_coils, kx_dim, ky_dim) if dataset is None (legacy behavior)
         """
         with torch.no_grad():
+            # Initialize format flags
+            new_format = False
+            coil_less = False
+            ns = None
+            ne = None
+            nt = None
+            nc = None
+            
             # Use grid from dataset if provided
             if dataset is not None:
                 if hasattr(dataset, 'get_grid_coordinates'):
                     grid_coords = dataset.get_grid_coordinates().to(self.device)
-                    # grid_coords shape (brain, coil-less): (num_echoes, kx_dim, ky_dim, 3)
-                    if grid_coords.shape[-1] == 3:
+                    # grid_coords shape (brain, new format): (num_slices, kx_dim, ky_dim, num_echoes, 4)
+                    if grid_coords.shape[-1] == 4 and len(grid_coords.shape) == 5:
+                        ns, nx, ny, ne = grid_coords.shape[:4]
+                        nc = 1
+                        coil_less = True
+                        new_format = True
+                    elif grid_coords.shape[-1] == 3:
+                        # Legacy 3D format: (num_echoes, kx_dim, ky_dim, 3)
                         nt, nx, ny = grid_coords.shape[:3]
                         nc = 1
                         coil_less = True
+                        new_format = False
                     else:
                         # legacy path with coils: (num_echoes, num_coils, kx_dim, ky_dim, 4)
                         nt, nc, nx, ny = grid_coords.shape[:4]
                         coil_less = False
+                        new_format = False
                 else:
                     raise ValueError("Dataset does not have get_grid_coordinates method. Use BrainDataset or provide grid manually.")
             else:
@@ -125,39 +161,59 @@ class NIKSiren(NIKBase):
                 grid_coords = torch.stack(torch.meshgrid(ts, kc, kxs, kys, indexing='ij'), -1).to(self.device) # nt, nc, nx, ny, 4
 
             # Compute distance to center for masking
-            if 'coil_less' in locals() and coil_less:
-                # kx, ky at indices 1,2
+            if new_format:
+                # New 4D format: [slice, kx, ky, echo] - kx, ky at indices 1, 2
+                dist_to_center = torch.sqrt(grid_coords[:,:,:,:,1]**2 + grid_coords[:,:,:,:,2]**2)
+            elif coil_less:
+                # Legacy 3D format: kx, ky at indices 1,2
                 dist_to_center = torch.sqrt(grid_coords[:,:,:,1]**2 + grid_coords[:,:,:,2]**2)
             else:
                 # legacy: kx, ky at indices 2,3
                 dist_to_center = torch.sqrt(grid_coords[:,:,:,:,2]**2 + grid_coords[:,:,:,:,3]**2)
 
-            # split t (echoes) for memory saving
-            t_split = 1
-            t_split_num = np.ceil(nt / t_split).astype(int)
-
-            kpred_list = []
-            for t_batch in range(t_split_num):
-                grid_coords_batch = grid_coords[t_batch*t_split:(t_batch+1)*t_split]
-
-                # Flatten coordinates appropriately
-                if 'coil_less' in locals() and coil_less:
-                    grid_coords_batch = grid_coords_batch.reshape(-1, 3).requires_grad_(False)
-                else:
-                    grid_coords_batch = grid_coords_batch.reshape(-1, 4).requires_grad_(False)
-                # get prediction
-                sample = {'coords': grid_coords_batch}
+            # Flatten coordinates for prediction
+            if new_format:
+                # New 4D format: (num_slices, kx_dim, ky_dim, num_echoes, 4)
+                grid_coords_flat = grid_coords.reshape(-1, 4).requires_grad_(False)
+                # Process all at once (or split if memory is an issue)
+                sample = {'coords': grid_coords_flat}
                 sample = self.pre_process(sample)
                 kpred = self.forward(sample)
                 kpred = self.post_process(kpred)
-                kpred_list.append(kpred)
-            kpred = torch.concat(kpred_list, 0)
-            
-            # Reshape prediction
-            if 'coil_less' in locals() and coil_less:
-                kpred = kpred.reshape(nt, nx, ny)
+                # Reshape to (num_slices, kx_dim, ky_dim, num_echoes) then permute to (num_slices, num_echoes, kx_dim, ky_dim)
+                kpred = kpred.reshape(ns, nx, ny, ne)
+                kpred = kpred.permute(0, 3, 1, 2)  # (num_slices, num_echoes, kx_dim, ky_dim)
             else:
-                kpred = kpred.reshape(nt, nc, nx, ny)
+                # Legacy format: split t (echoes) for memory saving
+                if coil_less:
+                    t_split = 1
+                    t_split_num = np.ceil(nt / t_split).astype(int)
+                else:
+                    t_split = 1
+                    t_split_num = np.ceil(nt / t_split).astype(int)
+
+                kpred_list = []
+                for t_batch in range(t_split_num):
+                    grid_coords_batch = grid_coords[t_batch*t_split:(t_batch+1)*t_split]
+
+                    # Flatten coordinates appropriately
+                    if 'coil_less' in locals() and coil_less:
+                        grid_coords_batch = grid_coords_batch.reshape(-1, 3).requires_grad_(False)
+                    else:
+                        grid_coords_batch = grid_coords_batch.reshape(-1, 4).requires_grad_(False)
+                    # get prediction
+                    sample = {'coords': grid_coords_batch}
+                    sample = self.pre_process(sample)
+                    kpred_batch = self.forward(sample)
+                    kpred_batch = self.post_process(kpred_batch)
+                    kpred_list.append(kpred_batch)
+                kpred = torch.concat(kpred_list, 0)
+                
+                # Reshape prediction
+                if coil_less:
+                    kpred = kpred.reshape(nt, nx, ny)
+                else:
+                    kpred = kpred.reshape(nt, nc, nx, ny)
             
             # Mask outer k-space points (optional)
             # Get masking configuration from config, with defaults
@@ -169,10 +225,22 @@ class NIKSiren(NIKBase):
                 if k_mask_type == 'circular':
                     # Circular mask: dist_to_center >= k_outer
                     # Note: This will appear as an oval if nx != ny (rectangular grid)
-                    kpred[dist_to_center>=k_outer] = 0
+                    if new_format:
+                        kpred = kpred.permute(0, 2, 3, 1)  # (num_slices, kx_dim, ky_dim, num_echoes) for masking
+                        kpred[dist_to_center>=k_outer] = 0
+                        kpred = kpred.permute(0, 3, 1, 2)  # Back to (num_slices, num_echoes, kx_dim, ky_dim)
+                    else:
+                        kpred[dist_to_center>=k_outer] = 0
                 elif k_mask_type == 'rectangular':
                     # Rectangular mask: max(|kx|, |ky|) >= k_outer
-                    if 'coil_less' in locals() and coil_less:
+                    if new_format:
+                        kx_coords = grid_coords[:,:,:,:,1].abs()
+                        ky_coords = grid_coords[:,:,:,:,2].abs()
+                        mask = torch.maximum(kx_coords, ky_coords) >= k_outer
+                        kpred = kpred.permute(0, 2, 3, 1)  # (num_slices, kx_dim, ky_dim, num_echoes) for masking
+                        kpred[mask] = 0
+                        kpred = kpred.permute(0, 3, 1, 2)  # Back to (num_slices, num_echoes, kx_dim, ky_dim)
+                    elif 'coil_less' in locals() and coil_less:
                         kx_coords = grid_coords[:,:,:,1].abs()
                         ky_coords = grid_coords[:,:,:,2].abs()
                         mask = torch.maximum(kx_coords, ky_coords) >= k_outer
@@ -186,10 +254,16 @@ class NIKSiren(NIKBase):
                     # Elliptical mask accounting for aspect ratio
                     # Normalize by aspect ratio so it appears circular on rectangular grid
                     aspect_ratio = ny / nx if nx > 0 else 1.0
-                    if 'coil_less' in locals() and coil_less:
+                    if new_format:
+                        kx_coords = grid_coords[:,:,:,:,1]
+                        ky_coords = grid_coords[:,:,:,:,2]
+                        dist_to_center_ellipse = torch.sqrt(kx_coords**2 + (ky_coords * aspect_ratio)**2)
+                        kpred = kpred.permute(0, 2, 3, 1)  # (num_slices, kx_dim, ky_dim, num_echoes) for masking
+                        kpred[dist_to_center_ellipse>=k_outer] = 0
+                        kpred = kpred.permute(0, 3, 1, 2)  # Back to (num_slices, num_echoes, kx_dim, ky_dim)
+                    elif coil_less:
                         kx_coords = grid_coords[:,:,:,1]
                         ky_coords = grid_coords[:,:,:,2]
-                        # Scale ky by aspect ratio to make mask circular on display
                         dist_to_center_ellipse = torch.sqrt(kx_coords**2 + (ky_coords * aspect_ratio)**2)
                         kpred[dist_to_center_ellipse>=k_outer] = 0
                     else:
@@ -200,10 +274,10 @@ class NIKSiren(NIKBase):
                 else:
                     raise ValueError(f"Unknown k_mask_type: {k_mask_type}. Must be 'circular', 'rectangular', or 'elliptical'")
             
-            # Add slice dimension if dataset was provided (for compatibility with reconstruct_images)
-            # reconstruct_images now expects (slices, echoes, kx, ky) for brain
-            if dataset is not None:
-                if 'coil_less' in locals() and coil_less:
+            # For legacy format, add slice dimension if dataset was provided (for compatibility with reconstruct_images)
+            # New format already has correct shape (num_slices, num_echoes, kx_dim, ky_dim)
+            if dataset is not None and not new_format:
+                if coil_less:
                     kpred = kpred.unsqueeze(0)  # (1, nt, nx, ny)
                 else:
                     kpred = kpred.unsqueeze(0)  # (1, nt, nc, nx, ny)
@@ -223,16 +297,17 @@ function in your NIK model class).
 """
 
 class Siren(nn.Module):
-    def __init__(self, hidden_features, num_layers, out_dim, omega_0=30, exp_out=True) -> None:
+    def __init__(self, hidden_features, num_layers, out_dim,
+                 omega_0_first=30, omega_0_hidden=30) -> None:
         super().__init__()
 
-        self.net = [SineLayer(hidden_features, hidden_features, is_first=True, omega_0=omega_0)]
+        self.net = [SineLayer(hidden_features, hidden_features, is_first=True, omega_0=omega_0_first)]
         for i in range(num_layers-1):
-            self.net.append(SineLayer(hidden_features, hidden_features, is_first=False, omega_0=omega_0))
+            self.net.append(SineLayer(hidden_features, hidden_features, is_first=False, omega_0=omega_0_hidden))
         final_linear = nn.Linear(hidden_features, out_dim*2)
         with torch.no_grad():
-            final_linear.weight.uniform_(-np.sqrt(6 / hidden_features) / omega_0, 
-                                          np.sqrt(6 / hidden_features) / omega_0)
+            final_linear.weight.uniform_(-np.sqrt(6 / hidden_features) / omega_0_hidden, 
+                                          np.sqrt(6 / hidden_features) / omega_0_hidden)
         self.net.append(final_linear)
         self.net = nn.Sequential(*self.net)
     
